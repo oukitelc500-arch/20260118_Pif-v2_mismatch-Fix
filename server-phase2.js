@@ -1,66 +1,39 @@
-// server-phase2.js - Relay server for PIF Phase 2 data
+// server-phase2.js - Phase 2 Relay Server (FIXED TIMEOUT)
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json({ limit: "50mb" })); // Increased for Rating Justification text
+app.use(express.json({ limit: "50mb" })); // Increased from 10mb
 
-// Your NEW Apps Script URL (set as environment variable on Render)
-const PHASE2_GOOGLE_SCRIPT = process.env.PHASE2_GOOGLE_SCRIPT_URL || "";
+const DEFAULT_GOOGLE_SCRIPT = process.env.GOOGLE_SCRIPT_URL || "https://script.google.com/macros/s/AKfycbyHaXWSmn8y1vGlCKI9xMx4jQi5R_zm_WXSwY6LRYJ3jq6WeeACpesf4pJp566npUmc8Q/exec";
 
-// Health check
+// Health endpoint
 app.get("/", (req, res) => {
-  res.json({
-    status: "alive",
-    service: "PIF Phase 2 Relay",
-    version: "1.0.0",
-    timestamp: new Date().toISOString(),
-    configured: !!PHASE2_GOOGLE_SCRIPT
-  });
+  res.send("Phase 2 Relay Server alive. POST /upload with JSON { sheetName, values }");
 });
 
-// Upload endpoint
+// Main relay endpoint with LONGER TIMEOUT
 app.post("/upload", async (req, res) => {
   try {
-    console.log("[Phase2 Relay] Received upload request");
-    
     const body = req.body;
-    
-    // Get script URL (allow override from request)
-    const scriptUrl = (body.googleScriptUrl && String(body.googleScriptUrl).trim()) || PHASE2_GOOGLE_SCRIPT;
+    const scriptUrl = (body.googleScriptUrl && String(body.googleScriptUrl).trim()) || DEFAULT_GOOGLE_SCRIPT;
     
     if (!scriptUrl) {
-      console.error("[Phase2 Relay] No Google Script URL configured");
-      return res.status(400).json({ 
-        ok: false, 
-        error: "No script URL configured. Set PHASE2_GOOGLE_SCRIPT_URL environment variable." 
-      });
+      return res.status(400).json({ ok: false, error: "No script URL configured." });
     }
 
-    // Validate payload
     if (!body.values || !Array.isArray(body.values)) {
-      console.error("[Phase2 Relay] Invalid payload - missing values array");
-      return res.status(400).json({ 
-        ok: false, 
-        error: "Missing or invalid 'values' array in payload." 
-      });
+      return res.status(400).json({ ok: false, error: "Missing or invalid 'values' array in payload." });
     }
     
-    console.log(`[Phase2 Relay] Forwarding ${body.values.length} rows to Apps Script`);
-    
-    // Log sample data (first row only, truncate Rating Justification)
-    if (body.values.length > 0) {
-      const sampleRow = body.values[0].slice(0, 10);
-      console.log(`[Phase2 Relay] Sample row:`, sampleRow);
-    }
-    
-    // Prepare payload for Apps Script
     const forward = {
       sheetName: body.sheetName || "PIF_Master",
       values: body.values
     };
 
-    // Forward to Google Apps Script with retries
+    console.log(`[Relay] Uploading ${body.values.length} rows to ${body.sheetName || 'PIF_Master'}...`);
+
+    // Try twice with LONGER TIMEOUT (120 seconds instead of 30)
     let tryCount = 0;
     let lastErr = null;
     
@@ -68,10 +41,8 @@ app.post("/upload", async (req, res) => {
       tryCount++;
       
       try {
-        console.log(`[Phase2 Relay] Attempt ${tryCount}: Sending to Apps Script...`);
-        
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+        const timeoutId = setTimeout(() => controller.abort(), 120000); // 120 seconds (was 15s)
         
         const r = await fetch(scriptUrl, {
           method: "POST",
@@ -82,32 +53,23 @@ app.post("/upload", async (req, res) => {
         
         clearTimeout(timeoutId);
         
-        // Apps Script returns 302 redirect on success
-        if (r.ok || r.status === 302) {
+        if (r.ok || r.status === 302) { 
           const text = await r.text().catch(() => "");
-          console.log(`[Phase2 Relay] ✅ Success! Status: ${r.status}`);
-          
-          return res.json({ 
-            ok: true, 
-            forwarded: true, 
-            status: r.status, 
-            rowsForwarded: body.values.length,
-            response: text
-          });
+          console.log(`[Relay] Success! Status: ${r.status}`);
+          return res.json({ ok: true, forwarded: true, status: r.status, text });
         } else {
-          lastErr = `Apps Script returned ${r.status}`;
-          console.error(`[Phase2 Relay] Apps Script error: ${r.status}`);
+          lastErr = `Non-OK response ${r.status}`;
+          console.error(`[Relay] Attempt ${tryCount} failed: ${r.status}`);
           
-          // If 5xx error, retry
           if (r.status >= 500 && tryCount < 2) {
-            console.log(`[Phase2 Relay] Retrying in 2 seconds...`);
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            console.log('[Relay] Retrying in 1 second...');
+            await new Promise(r => setTimeout(r, 1000));
             continue;
           } else {
             const text = await r.text().catch(() => "");
             return res.status(502).json({ 
               ok: false, 
-              error: `Apps Script failed: ${r.status}`, 
+              error: `Forward failed ${r.status}`, 
               status: r.status, 
               gasResponse: text 
             });
@@ -115,42 +77,39 @@ app.post("/upload", async (req, res) => {
         }
       } catch (fetchError) {
         if (fetchError.name === 'AbortError') {
-          lastErr = 'Request timeout (30s)';
-          console.error(`[Phase2 Relay] Timeout on attempt ${tryCount}`);
+          lastErr = 'Request timeout (120s)';
+          console.error(`[Relay] Attempt ${tryCount} timed out after 120 seconds`);
         } else {
           lastErr = fetchError.message;
-          console.error(`[Phase2 Relay] Fetch error:`, fetchError.message);
+          console.error(`[Relay] Attempt ${tryCount} error:`, fetchError.message);
         }
         
-        // Retry on network errors
         if (tryCount < 2) {
-          console.log(`[Phase2 Relay] Retrying in 2 seconds...`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          console.log('[Relay] Retrying in 2 seconds...');
+          await new Promise(r => setTimeout(r, 2000));
           continue;
         }
       }
     }
     
-    // All retries failed
-    console.error(`[Phase2 Relay] ❌ All attempts failed: ${lastErr}`);
     return res.status(502).json({ 
       ok: false, 
       error: "Forward failed after retries", 
       details: lastErr 
     });
     
-  } catch (error) {
-    console.error("[Phase2 Relay] Server error:", error.message);
+  } catch (err) {
+    console.error("[Relay] Error:", err.message);
     return res.status(500).json({ 
       ok: false, 
       error: "Internal server error", 
-      details: error.message 
+      details: err.message 
     });
   }
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 Phase 2 Relay Server running on port ${PORT}`);
-  console.log(`📊 Apps Script configured: ${!!PHASE2_GOOGLE_SCRIPT}`);
+  console.log(`📊 Apps Script configured: ${!!DEFAULT_GOOGLE_SCRIPT}`);
 });
